@@ -1,141 +1,62 @@
 #!/usr/bin/python
 # coding: utf-8
+from itertools import chain
+import logging
 
 import sys
-import socket
-import random
-import wsgiref.handlers
-from cStringIO import StringIO
+from StringIO import StringIO
+from wsgi import IcapWsgiHandler
 
-options_response = """ICAP/1.0 200 OK
-Methods: REQMOD
-Service: SkyDNS ICAP
-Encapsulated: null-body=0
-Max-Connections: 15
-Options-TTL: 3600
-Allow: 204
-Preview: 0""".replace('\n', '\r\n')
+log = logging.getLogger('icap')
 
-resp_204 = """ICAP/1.0 204 No Modifications Needed
-Service: SkyDNS ICAP
-Encapsulated: null-body=0""".replace('\n', '\r\n')
-
-class IcapWsgiHandler(wsgiref.handlers.BaseHandler):
-    server_software = "SkyDNS"
-    os_environ =  {}
-    http_version  = "1.1"
-
-    def __init__(self, stdin, hdrout, bodyout, stderr, environ):
-        self.stdin = stdin
-        self.hdrout = hdrout
-        self.bodyout = bodyout
-        self.stderr = stderr
-        self.base_env = environ
-        self.headers_written = False
-
-    def _write(self, data):
-        if self.headers_written:
-            self.bodyout.write(data)
-        else:
-            self.hdrout.write(data)
-
-    def _flush(self):
-        if self.headers_written:
-            self.bodyout.flush()
-        else:
-            self.hdrout.flush()
-
-    def get_stdin(self):
-        return self.stdin
-
-    def get_stderr(self):
-        return self.stderr
-
-    def add_cgi_vars(self):
-        self.environ.update(self.base_env)
-
-    def send_headers(self):
-        wsgiref.handlers.BaseHandler.send_headers(self)
-        self.headers_written = True
-
-    def close(self):
-        wsgiref.handlers.BaseHandler.close(self)
-        self.headers_written = False
 
 class BadIcapRequest(ValueError):
     def __init__(self, code=400, *args):
         self.code = code
         ValueError.__init__(self, code, *args)
 
+
 class ChunkedError(ValueError):
     pass
+
 
 class NoBlockpageNeeded(Exception):
     pass
 
+
+class BadHttpRequest(Exception):
+    pass
+
+
+MAX_ICAP_HEADER_LEN = 8190
+MAX_HTTP_HEADER_LEN = 8190
+MAX_CHUNKLEN_LEN = 20
+MAX_HTTP_TRAILER_LEN = 8190
+
+icap_errors = {
+    400: "Bad Request",
+    413: "Request Entity Too Large",
+    418: "Bad Composition",
+    500: "Server Error",
+    501: "Method Not Implemented",
+    505: "ICAP Version Not Supported",
+}
+
+http_errors = {
+    400: ["Bad Request",
+          "Your browser sent a request that this "
+          "server could not understand."
+    ],
+    505: ["HTTP Version Not Supported",
+          "Your browser sent a request "
+          "using a version of HTTP protocol that this server does not "
+          "support."
+    ],
+}
+
+
 class ICAP(object):
-    """
-    Реализация протокола ICAP.
-
-    Пример использования:
-
-        app_icap = BlockpageApp()
-        server = socket.socket()
-
-        ...
-
-        sock, address = server.accept()
-
-        ...
-
-        sock.settimeout(30)
-        i = ICAP(app_icap, address[0])
-
-        try:
-            close_now = False
-            while not close_now:
-                data = sock.recv(4096)
-                if not data:
-                    break
-
-                resp, close_now = i.parse(data)
-                if resp:
-                    sock.sendall(resp)
-
-        except gevent.socket.error:
-            pass
-        finally:
-            sock.close()
-    """
-
-    _MAX_ICAP_HEADER_LEN = 8190
-    _MAX_HTTP_HEADER_LEN = 8190
-    _MAX_CHUNKLEN_LEN = 20
-    _MAX_HTTP_TRAILER_LEN = 8190
-
-    _icap_errors = {
-            0:   "Unknown Error",
-            400: "Bad Request",
-            413: "Request Entity Too Large",
-            418: "Bad Composition",
-            500: "Server Error",
-            501: "Method Not Implemented",
-            505: "ICAP Version Not Supported",
-            }
-
-    _http_errors = {
-            0:   ["Unknown Error", "Your browser sent a well-formed request "
-                "that was nevertheless classified as an error. No further "
-                "information is available at this time."],
-            400: ["Bad Request", "Your browser sent a request that this "
-                "server could not understand."],
-            505: ["HTTP Version Not Supported", "Your browser sent a request "
-                "using a version of HTTP protocol that this server does not "
-                "support."],
-            }
-
-
-    def __init__(self, application, remote_addr):
+    def __init__(self):
         """
         Создает ICAP-сессию.
 
@@ -152,8 +73,6 @@ class ICAP(object):
         HTTP_X_CLIENT_IP: адрес клиента этого прокси (если известен)
         """
 
-        self._application = application
-        self._remote_addr = remote_addr
         self._buffered_line = []
         self._init_request()
         self._expect_icap_firstline()
@@ -168,6 +87,9 @@ class ICAP(object):
         строка, которую надо послать обратно клиенту, close_now - булев
         флаг, который означает, что после отправки reply надо закрыть
         соединение.
+
+        :type data: bytes
+
         """
 
         dpos = 0
@@ -190,7 +112,6 @@ class ICAP(object):
                 close_now = True
         return ''.join(portions), close_now
 
-
     # Все ниже этой строки - детали реализации.
     def _init_request(self):
         self._deferred_error_code = None
@@ -208,17 +129,28 @@ class ICAP(object):
         self._has_body = False
         self._client_ip = None
 
-    def _maybe_close(self, headers):
+    def _flatten_headers(self, headers):
+        """
+        :type headers: list
+        """
         if self._connection_close:
-            return headers + '\r\nConnection: close\r\n\r\n', True
+            return '\r\n'.join(chain(headers, ['Connection: close', '', ''])), True
         else:
-            return headers + '\r\n\r\n', False
+            # TODO: Force Connection: keep-alive ?!
+            return '\r\n'.join(chain(headers, ['',  ''])), False
 
     def _register_line_portion(self, portion):
+        """
+        :type portion: bytes
+        """
         self._buffered_line.append(portion)
         self._max_len -= len(portion)
 
     def _linemode(self, data, offset):
+        """
+        :type offset: int
+        :type data: bytes
+        """
         xpos = data.find('\n', offset, offset + self._max_len)
         if xpos != -1:
             self._register_line_portion(data[offset:xpos + 1])
@@ -233,6 +165,10 @@ class ICAP(object):
         return len(data), "", False
 
     def _bytemode(self, data, offset):
+        """
+        :type offset: int
+        :type data: bytes
+        """
         if offset + self._max_len <= len(data):
             endpos = offset + self._max_len
             self._max_len = 0
@@ -247,17 +183,22 @@ class ICAP(object):
     def _expect_icap_firstline(self):
         self._mode = self._linemode
         self._on_data = self._parse_icap_firstline
-        self._max_len = self._MAX_ICAP_HEADER_LEN
+        self._max_len = MAX_ICAP_HEADER_LEN
         self._length_exception = BadIcapRequest(413)
 
     def _parse_icap_firstline(self, line):
+        """
+        :type line: bytes
+        """
         self._init_request()
         try:
             self._icap_method, self._icap_uri, self._icap_version = line.split(' ')
         except ValueError:
             raise BadIcapRequest(400)
+
         if not self._icap_version.startswith('ICAP/1.'):
             raise BadIcapRequest(505)
+
         # XXX validate the URI
         self._expect_icap_header()
         return '', False
@@ -269,6 +210,9 @@ class ICAP(object):
         # self._length_exception = BadIcapRequest(413)  # i.e. unchanged
 
     def _parse_icap_header(self, line):
+        """
+        :type line: bytes
+        """
         if line == '\r\n' or line == '\n':
             return self._parse_icap_emptyline()
 
@@ -323,12 +267,22 @@ class ICAP(object):
             raise BadIcapRequest(self._deferred_error_code)
         if self._icap_host is None:
             raise BadIcapRequest(400)
+
         # XXX more validation of host
         if self._icap_method == 'OPTIONS':
             if self._http_hdr_len is not None:
                 raise BadIcapRequest(418)
             self._expect_icap_firstline()
-            return self._maybe_close(options_response)
+            return self._flatten_headers([
+                'ICAP/1.0 200 OK',
+                'Methods: REQMOD',
+                'Service: SkyDNS ICAP',
+                'Encapsulated: null-body=0',
+                'Max-Connections: 15',
+                'Options-TTL: 3600',
+                'Allow: 204',
+                'Preview: 0',
+            ])
 
         if self._icap_method != 'REQMOD':
             raise BadIcapRequest(501)
@@ -343,7 +297,7 @@ class ICAP(object):
 
         if self._max_len < 0:
             raise BadIcapRequest(400)
-        if self._max_len > self._MAX_HTTP_HEADER_LEN:
+        if self._max_len > MAX_HTTP_HEADER_LEN:
             raise BadIcapRequest(413)
 
         if self._has_preview and not self._has_body:
@@ -360,6 +314,9 @@ class ICAP(object):
         self._on_data = self._parse_http_firstline
 
     def _parse_http_firstline(self, line):
+        """
+        :type line: bytes
+        """
         try:
             self._http_method, self._http_uri, self._http_version = line.split(' ')
         except ValueError:
@@ -380,6 +337,7 @@ class ICAP(object):
         # self._length_exception does not make sense in byte mode
         self._on_data = self._parse_http_header_garbage
 
+    #noinspection PyUnusedLocal
     def _parse_http_header_garbage(self, data):
         if self._max_len == 0:
             return self._parse_http_emptyline()
@@ -392,6 +350,9 @@ class ICAP(object):
         self._on_data = self._parse_http_header
 
     def _parse_http_header(self, line):
+        """
+        :type line: bytes
+        """
         self._http_headers.append(line)
         if line == '\r\n' or line == '\n':
             return self._parse_http_emptyline()
@@ -438,21 +399,31 @@ class ICAP(object):
 
         if self._has_preview or self._allow_204:
             self._eat_body = True
-            return self._maybe_close(resp_204)[0], close_now
+            return self._flatten_headers([
+                'ICAP/1.0 204 No Modifications Needed',
+                'Service: SkyDNS ICAP',
+                'Encapsulated: null-body=0',
+            ])[0], close_now
 
         self._eat_body = False
         return self._make_200_mirror_response(), close_now
 
     def _maybe_eat(self, data):
+        """
+        :type data: bytes
+        """
         return '' if self._eat_body else data
 
     def _expect_chunklen_line(self):
         self._mode = self._linemode
         self._on_data = self._parse_chunklen_line
-        self._max_len = self._MAX_CHUNKLEN_LEN
+        self._max_len = MAX_CHUNKLEN_LEN
         self._length_exception = ChunkedError()
 
     def _parse_chunklen_line(self, line):
+        """
+        :type line: bytes
+        """
         semicolon = line.find(';') # -1 is OK, too
         try:
             self._max_len = int(line[:semicolon], 16)
@@ -474,6 +445,9 @@ class ICAP(object):
         # self._length_exception does not make sense in byte mode
 
     def _parse_chunk(self, chunk):
+        """
+        :type chunk: bytes
+        """
         if self._max_len == 0:
             self._expect_crlf_after_chunk()
         return self._maybe_eat(chunk), False
@@ -485,47 +459,48 @@ class ICAP(object):
         # self._length_exception = ChunkedError()  # i.e. unchanged
 
     def _parse_crlf_after_chunk(self, line):
+        """
+        :type line: bytes
+        """
         if line == '\r\n' or line == '\n':
             self._on_data = self._parse_chunklen_line
-            self._max_len = self._MAX_CHUNKLEN_LEN
+            self._max_len = MAX_CHUNKLEN_LEN
             return self._maybe_eat(line), False
-        raise ChunkedRrror
+        raise ChunkedError
 
     def _expect_trailer_line(self):
         # self._mode = self._linemode               # i.e. unchanged
         self._on_data = self._parse_trailer_line
-        self._max_len = self._MAX_HTTP_TRAILER_LEN
+        self._max_len = MAX_HTTP_TRAILER_LEN
         # self._length_exception = ChunkedError()  # i.e. unchanged
 
     def _parse_trailer_line(self, line):
+        """
+        :type line: bytes
+        """
         close_now = False
         if line == '\r\n' or line == '\n':
             close_now = self._connection_close
             self._expect_icap_firstline()
         return self._maybe_eat(line), close_now
 
-    def _make_http_response_ex(self, headers, body):
-        icap_headers = (
-                "ICAP/1.0 200 OK\r\n"
-                "Service: SkyDNS ICAP\r\n"
-                "Encapsulated: res-hdr=0, res-body=" + str(len(headers)))
+    def _make_http_response_ex(self, http_headers, http_body):
+        """
+        :type http_body: bytes
+        :type http_headers: bytes
+        """
+        icap_headers = [
+            "ICAP/1.0 200 OK",
+            "Service: SkyDNS ICAP",
+            "Encapsulated: res-hdr=0, res-body={0}".format(len(http_headers))
+        ]
 
-        if len(body):
-            chunk1 = hex(len(body))[2:] + '\r\n'
-            chunk2 = '\r\n0\r\n\r\n'
-            return self._maybe_close(icap_headers)[0] + headers + chunk1 + body + chunk2
-        else:
-            chunk2 = '0\r\n\r\n'
-            return self._maybe_close(icap_headers)[0] + headers + chunk2
+        # chunkize http_body :)
+        # TODO: of body is generator - generate chunks using yield
+        if http_body:
+            http_body = '{0:x}\r\n{1}\r\n'.format(len(http_body), http_body)
 
-    def _make_http_response(self, code, errorstr, add_headers="", text=""):
-        http_headers = (
-                "HTTP/1.1 %s %s\r\n"
-                "Content-Type: text/html\r\n"
-                "Content-Length: %s\r\n%s\r\n" %
-                (str(code), errorstr, str(len(text)), add_headers))
-
-        return self._make_http_response_ex(http_headers, text)
+        return self._flatten_headers(icap_headers)[0] + http_headers + http_body + '0\r\n\r\n'
 
     def _make_blockpage(self):
         stdin = StringIO('')
@@ -533,10 +508,10 @@ class ICAP(object):
         bodyout = StringIO()
         stderr = sys.stderr
         env = {
-            'REMOTE_ADDR':      self._remote_addr,
-            'SERVER_PROTOCOL':  self._http_version,
-            'REQUEST_METHOD':   'GET',  # fake
-            'HTTP_HOST':        self._http_host or "_default_",
+            'REMOTE_ADDR': self._remote_addr,
+            'SERVER_PROTOCOL': self._http_version,
+            'REQUEST_METHOD': 'GET', # fake
+            'HTTP_HOST': self._http_host or "_default_",
             'HTTP_X_CLIENT_IP': self._client_ip,
             # TODO: other variables, but not everything!
         }
@@ -545,54 +520,68 @@ class ICAP(object):
         handler.run(self._application)
 
         stdin.close()
-        headers = hdrout.getvalue()
+        http_headers = hdrout.getvalue()
         hdrout.close()
-        body = bodyout.getvalue()
+        http_body = bodyout.getvalue()
         bodyout.close()
 
-        if headers.startswith("HTTP/1.1 204 ") or headers.startswith("HTTP/1.0 204 "):
+        if http_headers.startswith("HTTP/1.1 204 ") or http_headers.startswith("HTTP/1.0 204 "):
             raise NoBlockpageNeeded
 
-        return self._make_http_response_ex(headers, body)
+        return self._make_http_response_ex(http_headers, http_body)
 
     def _make_200_mirror_response(self):
-        ret = []
-        ret.append("ICAP/1.0 200 OK\r\nServer: SkyDNS ICAP\r\n")
-        if self._has_body:
-            ret.append("Encapsulated: req-hdr=0, req-body=" +
-                    str(self._http_hdr_len) + '\r\n')
-        else:
-            ret.append("Encapsulated: req-hdr=0, null-body=" +
-                    str(self._http_hdr_len) + '\r\n')
+        ret = [
+            'ICAP/1.0 200 OK',
+            'Server: SkyDNS ICAP',
+            'Encapsulated: req-hdr=0, {0}-body={1}'.format('req' if self._has_body else 'null', self._http_hdr_len),
+        ]
         if self._connection_close:
-            ret.append("Connection: close\r\n")
-        ret.append("\r\n")
-        ret.extend(self._http_headers)
-        return ''.join(ret)
+            ret.append('Connection: close')
+        ret.append('')
+        ret.append('')
+        return '\r\n'.join(ret) + ''.join(self._http_headers)
 
     def _make_icap_error(self, code):
-        try:
-            errorstr = self._icap_errors[code]
-        except KeyError:
-            print "ICAP error code not recognized: %s. This is a bug." % code
-            errorstr = self._icap_errors[0]
+        """
+        :type code: int
+        """
+        errorstr = icap_errors.get(code, None)
+        if errorstr is None:
+            log.error('Unknown Icap error code', code)
+            errorstr = 'Unknown error'
 
-        ret = ("ICAP/1.0 %s %s\r\n"
-                "Server: SkyDNS ICAP\r\n"
-                "Encapsulated: null-body=0\r\n"
-                "Connection: close\r\n\r\n" % (str(code), errorstr))
-        return ret
+        return '\r\n'.join([
+            'ICAP/1.0 {0} {1}'.format(code, errorstr),
+            "Server: SkyDNS ICAP",
+            "Encapsulated: null-body=0",
+            "Connection: close",
+            '',
+            '',
+        ])
 
-    # Ugly, TODO: remove this in favour of WSGI
     def _make_http_error(self, code):
-        try:
-            error = self._http_errors[code]
-        except KeyError:
-            print "HTTP error code not recognized: %s. This is a bug." % code
-            error = self._http_errors[0]
+        """
+        :type code: int
+        """
+        error_info = http_errors.get(code, None)
+        if error_info is None:
+            log.error('Unknown http error', code)
+            short_text = "Unknown Error"
+            long_text = ("Your browser sent a well-formed request "
+                         "that was nevertheless classified as an error. No further "
+                         "information is available at this time.")
+        else:
+            (short_text, long_text) = error_info
 
-        text = ("<html><head><title>%s</title></head>"
-                "<body><h1>%s</h1><p>%s</p></body></html>" %
-                (error[0], error[0], error[1]))
+        html = ("<html><head><title>{0}</title></head>"
+                "<body><h1>{1}</h1><p>{2}</p></body></html>".format(short_text, short_text, long_text))
 
-        return self._make_http_response(code, error[0], "", text)
+        http_headers = '\r\n'.join([
+            "HTTP/1.1 {0} {1}".format(code, short_text),
+            "Content-Type: text/html",
+            "Content-Length: {0}".format(len(html)),
+            '',
+        ])
+
+        return self._make_http_response_ex(http_headers, html)
