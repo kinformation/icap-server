@@ -466,9 +466,9 @@ class ICAP(object):
         try:
             self._max_len = int(line[:semicolon], 16)
         except:
-            raise ChunkedError
+            raise ChunkedError()
         if self._max_len < 0:
-            raise ChunkedError
+            raise ChunkedError()
 
         if self._max_len == 0:
             self._expect_trailer_line()
@@ -503,7 +503,7 @@ class ICAP(object):
         :type line: bytes
         """
         if line not in ('\r\n', '\n'):
-            raise ChunkedError
+            raise ChunkedError()
 
         self._on_data = self._parse_chunklen_line
         self._max_len = MAX_CHUNKLEN_LEN
@@ -548,7 +548,7 @@ class ICAP(object):
         http_body = 'You are blocked!'
 
         if http_headers.startswith("HTTP/1.1 204 ") or http_headers.startswith("HTTP/1.0 204 "):
-            raise NoBlockpageNeeded
+            raise NoBlockpageNeeded()
 
         return self._make_http_response_ex(http_headers, http_body)
 
