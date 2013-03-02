@@ -3,7 +3,7 @@ import wsgiref.handlers
 
 #noinspection PyClassicStyleClass
 class IcapWsgiHandler(wsgiref.handlers.BaseHandler):
-    server_software = "SkyDNS"
+    server_software = "my software"
     os_environ = {}
     http_version = "1.1"
 

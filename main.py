@@ -17,10 +17,11 @@ def main():
             data = sock.recv(4096)
             if not data:
                 break
-            (resp, close_now) = i.parse(data)
-            if resp:
-                sock.sendall(resp)
-
+            for (resp, close_now) in i.parse(data):
+                if resp:
+                    sock.sendall(resp)
+                # if close_now:
+                #     break
     finally:
         sock.close()
 
